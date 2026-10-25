@@ -1,0 +1,18 @@
+# The repo root ignores ios/ and android/ (generated Expo projects); here they
+# are the plugin's platform source.
+!ios/
+!android/
+.dart_tool/
+.packages
+build/
+pubspec.lock
+.flutter-plugins
+.flutter-plugins-dependencies
+android/.gradle/
+android/local.properties
+.build/
+.swiftpm/
+# The example's platform folders come from `flutter create .` and stay local.
+example/ios/
+example/android/
+example/pubspec.lock
