@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.1.0 (unreleased)
+## 0.1.0
 
 First version of the Flutter SDK, with the same behavior as the React Native
 SDK (`@appeeky/analytics-expo` 0.1.2):
