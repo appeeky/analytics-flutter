@@ -15,8 +15,6 @@ or organic store traffic.
   AdAttributionKit conversion value updates, the Play Install Referrer, the
   URL that opened the app and device fields.
 
-The package is not on pub.dev yet; add it from this repository.
-
 ## Install
 
 Requires Flutter 3.38 or later, iOS 13+ and Android 5.0 (API 21)+.
