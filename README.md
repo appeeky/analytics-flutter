@@ -225,7 +225,7 @@ replace the plugin's own.
 | `resolveAdServicesOnDevice` | `true` | Exchange the AdServices token with Apple from the device |
 | `flushInterval` | 10 s | How often queued events are sent while the app is open |
 | `flushAt` | `20` | Send as soon as this many events are queued |
-| `maxQueueSize` | `1000` | Oldest events are dropped beyond this |
+| `maxQueueSize` | `1000` | Oldest events are dropped beyond this; `first_open` and `ad_revenue` go last |
 | `sessionTimeout` | 30 min | Time in the background before a new session starts |
 | `context` | | `DeviceContext` fields that override the detected ones |
 | `getLaunchUrl` | | Fallback for the URL that opened the app |

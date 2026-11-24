@@ -97,6 +97,10 @@ class _Harness {
       );
 
   List<dynamic> storedQueue() => jsonDecode(storage.store[queueStorageKey] ?? '[]') as List<dynamic>;
+
+  List<String> queuedNames() => storedQueue().map((e) => (e as Map<String, dynamic>)['name'] as String).toList();
+
+  Map<String, dynamic> storedState() => jsonDecode(storage.store[stateStorageKey] ?? '{}') as Map<String, dynamic>;
 }
 
 class _Opts {
@@ -144,7 +148,7 @@ void main() {
     expect(first.attribution, <String, Object?>{'adServicesToken': 'tok', 'deepLinkUrl': 'myapp://open?aky_c=launch'});
     expect(first.context, <String, Object?>{'platform': 'ios', 'osVersion': '18.1', 'locale': 'tr-TR'},
         reason: 'empty fields are left out');
-    expect(first.body['sdk'], 'flutter/0.1.0');
+    expect(first.body['sdk'], 'flutter/0.2.0');
     expect(first.body['sdk'], 'flutter/$sdkVersion');
     expect(first.body['installId'], sdk.installId);
 
@@ -191,6 +195,7 @@ void main() {
     await sdk2.start();
     await sdk2.flush(force: true);
     expect(rejected.storedQueue(), isEmpty);
+    expect(rejected.sent, hasLength(1), reason: 'the attribution is not resent alone');
   });
 
   test('keeps the batch on 429', () async {
@@ -414,7 +419,7 @@ void main() {
     ]);
   });
 
-  test('drops the oldest events past maxQueueSize', () async {
+  test('drops the oldest ordinary events past maxQueueSize and keeps first_open', () async {
     final h = _Harness(options: const _Opts(maxQueueSize: 3), statuses: <int>[-1]);
     final sdk = h.make();
     await sdk.start();
@@ -423,7 +428,117 @@ void main() {
       sdk.track('e$i');
     }
     await tick();
-    expect(h.storedQueue().map((e) => (e as Map<String, dynamic>)['name']), <String>['e2', 'e3', 'e4']);
+    expect(h.storedQueue().map((e) => (e as Map<String, dynamic>)['name']), <String>['first_open', 'e3', 'e4']);
+  });
+
+  test('past the quota (402) the install is delivered and other events wait in the queue', () async {
+    final h = _Harness(statuses: <int>[402, 402, 202]);
+    final sdk = h.make();
+    await sdk.start();
+    await sdk.flush(force: true);
+    // The server stored the install, its attribution and first_open.
+    expect(h.sent, hasLength(1));
+    expect(h.sent[0].attribution, isNotNull);
+    expect(h.queuedNames(), <String>['session_start']);
+    expect(h.storedState()['attributionSent'], isTrue);
+
+    // While waiting, only critical events go out, without the attribution.
+    sdk.screen('Paywall');
+    sdk.adRevenue(0.02);
+    await tick();
+    await sdk.flush(force: true);
+    expect(h.sent, hasLength(2));
+    expect(h.sent[1].events.map((e) => e['name']), <String>['ad_revenue']);
+    expect(h.sent[1].body.containsKey('attribution'), isFalse);
+    expect(h.queuedNames(), <String>['session_start', 'screen']);
+
+    // Nothing ordinary is sent before the wait is over, even when forced.
+    await sdk.flush(force: true);
+    expect(h.sent, hasLength(2));
+
+    h.advance(16 * 60 * 1000);
+    await sdk.flush();
+    expect(h.sent, hasLength(3));
+    expect(h.sent[2].events.map((e) => e['name']), <String>['session_start', 'screen']);
+    expect(h.queuedNames(), isEmpty);
+  });
+
+  test('a second quota answer doubles the wait and keeps the queue', () async {
+    final h = _Harness(statuses: <int>[402, 402, 402]);
+    final sdk = h.make();
+    await sdk.start();
+    await sdk.flush(force: true);
+    h.advance(16 * 60 * 1000);
+    await sdk.flush();
+    expect(h.sent, hasLength(2));
+    h.advance(16 * 60 * 1000); // the wait is 30 minutes now
+    await sdk.flush();
+    expect(h.sent, hasLength(2));
+    h.advance(15 * 60 * 1000);
+    await sdk.flush();
+    expect(h.sent, hasLength(3));
+    expect(h.queuedNames(), <String>['session_start']);
+  });
+
+  test('a rejected batch does not give up the attribution at once', () async {
+    final h = _Harness(statuses: <int>[400, 202]);
+    final sdk = h.make();
+    await sdk.start();
+    await sdk.flush(force: true);
+    expect(h.sent, hasLength(1));
+    expect(h.queuedNames(), isEmpty);
+    expect(h.storedState()['attributionSent'], isNot(true));
+    expect(h.storedState()['attributionRejects'], 1);
+
+    sdk.screen('Home');
+    await tick();
+    await sdk.flush(force: true);
+    expect(h.sent, hasLength(2));
+    expect(h.sent[1].attribution, <String, Object?>{'deepLinkUrl': 'myapp://open?aky_c=launch'});
+    expect(h.storedState()['attributionSent'], isTrue);
+    expect(h.storedState().containsKey('attributionRejects'), isFalse);
+  });
+
+  test('the attribution is given up after three rejected batches', () async {
+    final h = _Harness(statuses: <int>[400, 400, 400, 202]);
+    final sdk = h.make();
+    await sdk.start();
+    await sdk.flush(force: true);
+    for (final name in <String>['a', 'b']) {
+      sdk.track(name);
+      await tick();
+      await sdk.flush(force: true);
+    }
+    expect(h.sent, hasLength(3));
+    expect(h.storedState()['attributionSent'], isTrue);
+    sdk.track('c');
+    await tick();
+    await sdk.flush(force: true);
+    expect(h.sent[3].body.containsKey('attribution'), isFalse);
+  });
+
+  test('a full queue evicts ordinary events before first_open and ad revenue', () async {
+    final h = _Harness(options: const _Opts(maxQueueSize: 3), statuses: <int>[-1]);
+    final sdk = h.make();
+    await sdk.start();
+    await sdk.flush(force: true); // offline: session_start and first_open stay queued
+    sdk.adRevenue(0.01);
+    sdk.screen('A');
+    sdk.screen('B');
+    await tick();
+    expect(h.queuedNames(), <String>['first_open', 'ad_revenue', 'screen']);
+  });
+
+  test("over-long attribution values are cut to the server's limits", () async {
+    final h = _Harness(
+      options: _Opts(getAdServicesToken: () async => 't' * 5000, resolveAdServicesOnDevice: false),
+      native: NativeBridge(getInstallReferrer: () async => 'utm_source=${'x' * 3000}'),
+    );
+    final sdk = h.make();
+    await sdk.start();
+    await sdk.flush(force: true);
+    expect((h.sent[0].attribution?['installReferrer'] as String).length, 2048);
+    expect(h.sent[0].attribution?.containsKey('adServicesToken'), isFalse, reason: 'a cut token is useless');
   });
 
   test('flushes as soon as flushAt events are queued', () async {

@@ -10,7 +10,7 @@ import 'dart:convert';
 import 'package:http/http.dart' as http;
 
 /// Version of this SDK, sent with every batch as `flutter/<version>`.
-const String sdkVersion = '0.1.0';
+const String sdkVersion = '0.2.0';
 
 /// Appeeky's hosted ingest endpoint; self-hosted servers pass their own.
 const String defaultEndpoint = 'https://ingest.appeeky.com/v1/ingest';
@@ -21,6 +21,25 @@ const int _maxBatch = 100;
 const int _maxBackoffMs = 5 * 60 * 1000;
 const Duration _attributionTimeout = Duration(seconds: 3);
 const Duration _requestTimeout = Duration(seconds: 30);
+
+/// The hosted service answers this once the account's monthly event quota is used up.
+const int _quotaStatus = 402;
+
+/// Wait before sending ordinary events again after a quota answer; doubles up to the maximum.
+const int _quotaRetryMs = 15 * 60 * 1000;
+const int _maxQuotaRetryMs = 6 * 60 * 60 * 1000;
+
+/// Events the server stores even past the quota, and the queue never evicts
+/// before ordinary ones. Keep in step with CRITICAL_EVENT_NAMES in
+/// packages/core/src/service.ts.
+const Set<String> _criticalEvents = <String>{'first_open', 'ad_revenue'};
+
+/// A batch rejected this many times with the attribution in it: give the attribution up.
+const int _maxAttributionRejects = 3;
+
+/// Server limits (packages/core/src/ingest-payload.ts); longer values would reject the batch.
+const int _maxTokenLength = 4096;
+const int _maxUrlLength = 2048;
 
 /// A single foreground stretch longer than this is clamped (clock jumps, stuck timers).
 const int _maxForegroundMs = 4 * 60 * 60 * 1000;
@@ -169,7 +188,8 @@ class AppeekyOptions {
   /// Flush as soon as this many events are queued.
   final int flushAt;
 
-  /// Oldest events are dropped past this many queued events.
+  /// Past this many queued events the oldest are dropped; `first_open` and
+  /// `ad_revenue` go last.
   final int maxQueueSize;
 
   /// A new session starts after this much time in the background.
@@ -237,6 +257,9 @@ class _State {
   int? lastActiveAt;
   bool attributionSent = false;
 
+  /// Batches the server rejected (4xx) while carrying the attribution.
+  int? attributionRejects;
+
   /// First launch time; "came back on a later day" is measured from it.
   int? installedAt;
 
@@ -255,6 +278,7 @@ class _State {
       ..sessionId = _asString(json['sessionId'])
       ..lastActiveAt = _asInt(json['lastActiveAt'])
       ..attributionSent = json['attributionSent'] == true
+      ..attributionRejects = _asInt(json['attributionRejects'])
       ..installedAt = _asInt(json['installedAt'])
       ..conversionValue = _asInt(json['conversionValue'])
       ..deepLinkDelivered = json['deepLinkDelivered'] == true;
@@ -266,6 +290,7 @@ class _State {
         'sessionId': sessionId,
         'lastActiveAt': lastActiveAt,
         'attributionSent': attributionSent ? true : null,
+        'attributionRejects': attributionRejects,
         'installedAt': installedAt,
         'conversionValue': conversionValue,
         'deepLinkDelivered': deepLinkDelivered ? true : null,
@@ -354,6 +379,10 @@ class AppeekyAnalytics {
   /// When the app last came to the foreground; null while in the background.
   int? _foregroundSince;
   int _retryAt = 0;
+
+  /// While now < _quotaUntil only critical events are sent; the rest wait in the queue.
+  int _quotaUntil = 0;
+  int _quotaBackoffMs = 0;
 
   /// The random install id, once the client has started; null before.
   String? get installId => _state?.installId;
@@ -548,9 +577,11 @@ class AppeekyAnalytics {
       _withTimeout(_opts.getInstallReferrer ?? native?.getInstallReferrer, _attributionTimeout),
       _withTimeout(_deps.launchUrl, _attributionTimeout),
     ]);
-    final adServicesToken = _nonEmpty(results[0], 4096);
-    final installReferrer = _nonEmpty(results[1], 2048);
-    final deepLinkUrl = _nonEmpty(results[2], 2048);
+    // A cut token is useless to Apple and the server, so an over-long one is left out.
+    final rawToken = results[0]?.trim();
+    final adServicesToken = rawToken == null || rawToken.isEmpty || rawToken.length > _maxTokenLength ? null : rawToken;
+    final installReferrer = _nonEmpty(results[1], _maxUrlLength);
+    final deepLinkUrl = _nonEmpty(results[2], _maxUrlLength);
     _deferredDeepLink = deferredDeepLinkFrom(installReferrer, deepLinkUrl);
     final attribution = _Attribution();
     if (adServicesToken != null) {
@@ -640,8 +671,10 @@ class AppeekyAnalytics {
       props: props,
       value: value,
     ));
-    if (_queue.length > _opts.maxQueueSize) {
-      _queue.removeRange(0, _queue.length - _opts.maxQueueSize);
+    // Full: the oldest ordinary event goes first; first_open and ad revenue stay.
+    while (_queue.length > _opts.maxQueueSize) {
+      final oldest = _queue.indexWhere((e) => !_criticalEvents.contains(e.name));
+      _queue.removeAt(oldest == -1 ? 0 : oldest);
     }
     unawaited(_persistQueue());
     if (_queue.length >= _opts.flushAt) unawaited(flush());
@@ -654,7 +687,8 @@ class AppeekyAnalytics {
       if (state == null) return;
       final attribution = _attribution;
       final sendAttribution = !state.attributionSent && attribution != null;
-      final batch = _queue.take(_maxBatch).toList();
+      final quotaMode = _deps.now() < _quotaUntil;
+      final batch = (quotaMode ? _queue.where((e) => _criticalEvents.contains(e.name)) : _queue).take(_maxBatch).toList();
       if (batch.isEmpty && !sendAttribution) return;
 
       final context = _context.toJson();
@@ -665,7 +699,8 @@ class AppeekyAnalytics {
         'context': context,
         'events': batch.map((e) => e.toJson()).toList(),
       };
-      if (sendAttribution && !attribution.isEmpty) body['attribution'] = attribution.toJson();
+      final hadAttribution = sendAttribution && !attribution.isEmpty;
+      if (hadAttribution) body['attribution'] = attribution.toJson();
 
       var status = 0;
       try {
@@ -688,23 +723,59 @@ class AppeekyAnalytics {
         if (status != 0) _log('batch not stored (HTTP $status); retrying in ${_backoffMs ~/ 1000}s');
         return;
       }
-      // 2xx: stored. Other 4xx: the server will never accept this batch, so
-      // drop it rather than retrying forever.
-      if (status >= 400) {
-        _log('batch rejected with HTTP $status');
-      } else {
-        _log('sent ${batch.length} events');
-      }
       _backoffMs = 0;
       _retryAt = 0;
+
+      if (status == _quotaStatus) {
+        // Past the account's quota the server stored the install, its
+        // attribution and the critical events. The other events stay queued
+        // and are sent again later.
+        final stored = batch.where((e) => _criticalEvents.contains(e.name)).map((e) => e.id).toSet();
+        _queue = _queue.where((e) => !stored.contains(e.id)).toList();
+        if (sendAttribution) _markAttributionSent();
+        await Future.wait(<Future<void>>[_persist(), _persistQueue()]);
+        // Already waiting: go on with the critical events that are left.
+        if (quotaMode) continue;
+        _quotaBackoffMs = _quotaBackoffMs == 0 ? _quotaRetryMs : _quotaBackoffMs * 2;
+        if (_quotaBackoffMs > _maxQuotaRetryMs) _quotaBackoffMs = _maxQuotaRetryMs;
+        _quotaUntil = _deps.now() + _quotaBackoffMs;
+        _log('event quota used up: installs and ad revenue are still sent, other events wait');
+        return;
+      }
+
       final sent = batch.map((e) => e.id).toSet();
       _queue = _queue.where((e) => !sent.contains(e.id)).toList();
-      if (sendAttribution) {
-        state.attributionSent = true;
-        _attribution = null;
+      if (status >= 400) {
+        // The server will never accept this batch: drop its events rather
+        // than retrying forever. The attribution is collected only once, so
+        // it rides on the next batches before it is given up.
+        _log('batch rejected with HTTP $status');
+        if (hadAttribution) {
+          final rejects = (state.attributionRejects ?? 0) + 1;
+          state.attributionRejects = rejects;
+          if (rejects >= _maxAttributionRejects) _markAttributionSent();
+        } else if (sendAttribution) {
+          _markAttributionSent();
+        }
+      } else {
+        _log('sent ${batch.length} events');
+        _quotaBackoffMs = 0;
+        _quotaUntil = 0;
+        if (sendAttribution) _markAttributionSent();
       }
       await Future.wait(<Future<void>>[_persist(), _persistQueue()]);
+      // Rejected with the attribution still pending: wait for new events
+      // instead of sending the attribution alone in a loop.
+      if (status >= 400 && _queue.isEmpty) return;
     }
+  }
+
+  void _markAttributionSent() {
+    final state = _state;
+    if (state == null) return;
+    state.attributionSent = true;
+    state.attributionRejects = null;
+    _attribution = null;
   }
 
   Future<String?> _safeGet(String key) async {

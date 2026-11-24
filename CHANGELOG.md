@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.2.0
+
+- When the account's event quota is used up (HTTP 402), the SDK no longer
+  drops the queue. The server still stores the install, its source and the
+  `first_open` and `ad_revenue` events; the other events wait on the device
+  and are sent again later (after 15 minutes, doubling up to 6 hours).
+  `first_open` and `ad_revenue` keep being sent while waiting.
+- A batch the server rejects with another 4xx no longer loses the install
+  source at once: the attribution is sent again with the next batches and is
+  given up only after three rejections.
+- A full queue drops the oldest ordinary events first; `first_open` and
+  `ad_revenue` are dropped only when nothing else is left.
+- An Apple Search Ads token longer than the server accepts (4096 characters)
+  is left out instead of being cut.
+
 ## 0.1.0
 
 First version of the Flutter SDK, with the same behavior as the React Native
