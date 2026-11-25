@@ -23,6 +23,8 @@ class Appeeky {
   /// `https://…/v1/ingest`. [getLaunchUrl] is a fallback for the URL that
   /// opened the app when the plugin did not see it (for example an iOS app
   /// on UIScene lifecycle: pass your deep link package's initial link).
+  /// [testDevice] reports the install as a test install, kept out of reports;
+  /// null (the default) means debug builds are.
   static AppeekyAnalytics init({
     required String key,
     String endpoint = defaultEndpoint,
@@ -36,6 +38,7 @@ class Appeeky {
     Future<String?> Function()? getInstallReferrer,
     Future<String?> Function()? getLaunchUrl,
     DeviceContext? context,
+    bool? testDevice,
     bool disabled = false,
   }) {
     final existing = _client;
@@ -55,6 +58,7 @@ class Appeeky {
         getAdServicesToken: getAdServicesToken,
         getInstallReferrer: getInstallReferrer,
         context: context,
+        testDevice: testDevice,
         disabled: disabled,
       ),
       CoreDeps(

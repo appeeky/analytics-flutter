@@ -10,7 +10,7 @@ import 'dart:convert';
 import 'package:http/http.dart' as http;
 
 /// Version of this SDK, sent with every batch as `flutter/<version>`.
-const String sdkVersion = '0.2.0';
+const String sdkVersion = '0.3.0';
 
 /// Appeeky's hosted ingest endpoint; self-hosted servers pass their own.
 const String defaultEndpoint = 'https://ingest.appeeky.com/v1/ingest';
@@ -74,6 +74,7 @@ class DeviceContext {
     this.osVersion,
     this.deviceModel,
     this.locale,
+    this.testDevice,
   });
 
   /// `ios` or `android`.
@@ -86,6 +87,10 @@ class DeviceContext {
   /// BCP 47 tag, for example `tr-TR`.
   final String? locale;
 
+  /// A debug build, a simulator or an emulator. The server stores the install
+  /// and keeps it out of reports. Sent only when true.
+  final bool? testDevice;
+
   /// Fields of [other] win where set.
   DeviceContext merge(DeviceContext? other) {
     if (other == null) return this;
@@ -96,6 +101,7 @@ class DeviceContext {
       osVersion: other.osVersion ?? osVersion,
       deviceModel: other.deviceModel ?? deviceModel,
       locale: other.locale ?? locale,
+      testDevice: other.testDevice ?? testDevice,
     );
   }
 
@@ -112,6 +118,7 @@ class DeviceContext {
     put('osVersion', osVersion, 64);
     put('deviceModel', deviceModel, 128);
     put('locale', locale, 35);
+    if (testDevice == true) out['testDevice'] = true;
     return out;
   }
 }
@@ -171,6 +178,7 @@ class AppeekyOptions {
     this.resolveAdServicesOnDevice = true,
     this.getInstallReferrer,
     this.context,
+    this.testDevice,
     this.disabled = false,
     this.debug = false,
   });
@@ -207,6 +215,9 @@ class AppeekyOptions {
 
   /// Override or fill in device context fields.
   final DeviceContext? context;
+
+  /// Report this install as a test install (kept out of reports); null detects it.
+  final bool? testDevice;
 
   /// Collect nothing and send nothing (e.g. the user opted out).
   final bool disabled;
@@ -365,6 +376,9 @@ class AppeekyAnalytics {
   List<_Event> _queue = <_Event>[];
   _Attribution? _attribution;
   DeviceContext _context = const DeviceContext();
+
+  /// Server warnings already handled in this launch.
+  final Set<String> _warned = <String>{};
   Future<void>? _ready;
 
   /// Completes once first-launch attribution is collected; batches wait for it.
@@ -405,7 +419,9 @@ class AppeekyAnalytics {
     final state = saved ?? _State(_deps.randomId());
     _state = state;
     final device = await _withTimeout(_deps.deviceContext, _attributionTimeout);
-    _context = (device ?? const DeviceContext()).merge(_opts.context);
+    _context = (device ?? const DeviceContext())
+        .merge(_opts.context)
+        .merge(DeviceContext(testDevice: _opts.testDevice));
 
     if (!state.attributionSent) {
       _attributionReady = _collectAttribution().catchError((Object err) {
@@ -492,7 +508,11 @@ class AppeekyAnalytics {
       if (state == null) return;
       final id = userId?.trim();
       final hasId = id != null && id.isNotEmpty;
-      state.userId = hasId ? truncate(id, 256) : null;
+      final next = hasId ? truncate(id, 256) : null;
+      // Apps call identify() on every launch. The id already rides on every
+      // batch's context, so only a change is worth an event.
+      if (next == state.userId) return;
+      state.userId = next;
       unawaited(_persist());
       // The user id rides on every batch's context; this event makes sure a
       // batch goes out soon so the install is linked before the first purchase.
@@ -710,7 +730,10 @@ class AppeekyAnalytics {
           ..bodyBytes = utf8.encode(jsonEncode(body));
         final response = await _deps.httpClient.send(request).timeout(_requestTimeout);
         status = response.statusCode;
-        await response.stream.drain<void>();
+        final bytes = await response.stream.toBytes();
+        if ((status >= 200 && status < 300) || status == _quotaStatus) {
+          _reportWarnings(warningsFrom(utf8.decode(bytes, allowMalformed: true)));
+        }
       } catch (err) {
         _log('network error: $err');
       }
@@ -800,10 +823,37 @@ class AppeekyAnalytics {
     } catch (_) {}
   }
 
+  /// Server warnings about a stored batch, said once per launch on a test
+  /// device or with `debug`.
+  void _reportWarnings(List<String> warnings) {
+    for (final warning in warnings) {
+      if (!_warned.add(warning)) continue;
+      final text = _warningText[warning];
+      if (text == null || !(_opts.debug || _context.testDevice == true)) continue;
+      _deps.logger('[appeeky-analytics] $text');
+    }
+  }
+
   void _log(String message) {
     if (!_opts.debug) return;
     _deps.logger('[appeeky-analytics] $message');
   }
+}
+
+const Map<String, String> _warningText = <String, String>{
+  'platform_mismatch':
+      "this key belongs to an app on the other store. Use the iOS app's key in the iOS build and the Android app's "
+          "key in the Android build; until then both platforms are mixed in one app's reports.",
+};
+
+/// The `warnings` strings of an ingest response body; empty when the body is
+/// missing, not JSON or has none.
+List<String> warningsFrom(String body) {
+  final json = _parseJson(body);
+  if (json is! Map) return const <String>[];
+  final warnings = json['warnings'];
+  if (warnings is! List) return const <String>[];
+  return warnings.whereType<String>().toList();
 }
 
 /// Storage keys, exposed for tests.

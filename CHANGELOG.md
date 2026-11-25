@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.3.0
+
+- Debug builds send `testDevice: true` in the batch context. The server
+  stores these installs as test installs and keeps them out of reports. The
+  new `testDevice` option of `init` overrides the detection.
+- `identify` does nothing when the user id is the one already stored, so it
+  can be called on every launch without sending an event each time.
+- The SDK reads the `warnings` of an ingest response. When the key belongs to
+  an app on the other store, it logs this once per launch, in debug builds or
+  with `debug: true`.
+
 ## 0.2.0
 
 - When the account's event quota is used up (HTTP 402), the SDK no longer

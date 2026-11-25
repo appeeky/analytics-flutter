@@ -30,7 +30,8 @@ class AppeekyNativeChannel {
   /// The first URL that opened the app (custom scheme or universal / app link).
   static Future<String?> launchUrl() => _string('getLaunchUrl');
 
-  /// App version, build, OS version and device model from the platform.
+  /// App version, build, OS version and device model from the platform, and
+  /// the test device flag in debug builds.
   static Future<DeviceContext> deviceContext() async {
     Map<String, Object?>? raw;
     try {
@@ -57,6 +58,8 @@ class AppeekyNativeChannel {
       osVersion: field('osVersion'),
       deviceModel: field('deviceModel'),
       locale: locale,
+      // A debug build. Profile and release builds leave the field out.
+      testDevice: kDebugMode ? true : null,
     );
   }
 

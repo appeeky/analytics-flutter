@@ -46,11 +46,18 @@ class _Harness {
     List<int> statuses = const <int>[],
     this.adServices,
     this.native,
+    this.device = const DeviceContext(platform: 'ios', osVersion: '18.1', locale: 'tr-TR', appVersion: ''),
+    this.responseBody = '',
   }) : _responses = List<int>.of(statuses);
 
   final _Opts options;
   final http.Response Function()? adServices;
   final NativeBridge? native;
+  final DeviceContext device;
+
+  /// Body of every ingest response.
+  final String responseBody;
+  final List<String> logs = <String>[];
   final List<int> _responses;
   final _MemoryStorage storage = _MemoryStorage();
   final List<_Sent> sent = <_Sent>[];
@@ -70,7 +77,7 @@ class _Harness {
     sent.add(_Sent(request.url.toString(), request.headers, jsonDecode(request.body) as Map<String, dynamic>));
     final status = _responses.isEmpty ? 202 : _responses.removeAt(0);
     if (status == -1) throw http.ClientException('offline');
-    return http.Response('', status);
+    return http.Response(responseBody, status);
   });
 
   AppeekyAnalytics make() => AppeekyAnalytics(
@@ -82,7 +89,10 @@ class _Harness {
           sessionTimeout: options.sessionTimeout,
           getAdServicesToken: options.getAdServicesToken,
           resolveAdServicesOnDevice: options.resolveAdServicesOnDevice,
+          context: options.context,
+          testDevice: options.testDevice,
           disabled: options.disabled,
+          debug: options.debug,
         ),
         CoreDeps(
           native: native,
@@ -90,9 +100,10 @@ class _Harness {
           httpClient: client,
           now: () => clock,
           randomId: () => 'id${++_ids}',
-          deviceContext: () async => const DeviceContext(platform: 'ios', osVersion: '18.1', locale: 'tr-TR', appVersion: ''),
+          deviceContext: () async => device,
           launchUrl: () async => 'myapp://open?aky_c=launch',
           scheduler: _FakeScheduler(),
+          logger: logs.add,
         ),
       );
 
@@ -111,7 +122,10 @@ class _Opts {
     this.sessionTimeout = const Duration(minutes: 30),
     this.getAdServicesToken,
     this.resolveAdServicesOnDevice = true,
+    this.context,
+    this.testDevice,
     this.disabled = false,
+    this.debug = false,
   });
 
   final String? endpoint;
@@ -120,7 +134,10 @@ class _Opts {
   final Duration sessionTimeout;
   final Future<String?> Function()? getAdServicesToken;
   final bool resolveAdServicesOnDevice;
+  final DeviceContext? context;
+  final bool? testDevice;
   final bool disabled;
+  final bool debug;
 }
 
 /// Let queued callbacks, microtasks and mock HTTP round trips run.
@@ -131,6 +148,12 @@ Future<void> tick() async {
 }
 
 Future<String?> _token() async => 'tok';
+
+const String _mismatchText = "[appeeky-analytics] this key belongs to an app on the other store. Use the iOS app's key "
+    "in the iOS build and the Android app's key in the Android build; until then both platforms are mixed in one "
+    "app's reports.";
+const String _mismatchBody = '{"ok":true,"warnings":["platform_mismatch","something_new",7]}';
+const DeviceContext _testDevice = DeviceContext(platform: 'ios', testDevice: true);
 
 void main() {
   test('first launch sends first_open, session_start and attribution once', () async {
@@ -148,7 +171,7 @@ void main() {
     expect(first.attribution, <String, Object?>{'adServicesToken': 'tok', 'deepLinkUrl': 'myapp://open?aky_c=launch'});
     expect(first.context, <String, Object?>{'platform': 'ios', 'osVersion': '18.1', 'locale': 'tr-TR'},
         reason: 'empty fields are left out');
-    expect(first.body['sdk'], 'flutter/0.2.0');
+    expect(first.body['sdk'], 'flutter/0.3.0');
     expect(first.body['sdk'], 'flutter/$sdkVersion');
     expect(first.body['installId'], sdk.installId);
 
@@ -254,6 +277,133 @@ void main() {
     await sdk.flush(force: true);
     expect(h.sent.last.context.containsKey('userId'), isFalse);
     expect(h.allEvents.map((e) => e['name']), containsAllInOrder(<String>['identify', 'reset']));
+  });
+
+  test('identify() with the stored id sends nothing, also after a relaunch', () async {
+    final h = _Harness();
+    final first = h.make();
+    await first.start();
+    first.identify('rc_user_1');
+    first.identify('rc_user_1');
+    first.identify('  rc_user_1  ');
+    await tick();
+    await first.flush(force: true);
+    first.shutdown();
+    expect(h.allEvents.where((e) => e['name'] == 'identify'), hasLength(1));
+
+    final second = h.make();
+    await second.start();
+    await second.flush(force: true);
+    final before = h.sent.length;
+    second.identify('rc_user_1');
+    await tick();
+    await second.flush(force: true);
+    expect(h.sent, hasLength(before), reason: 'no event and no flush for an unchanged id');
+    expect(h.queuedNames(), isEmpty);
+
+    second.track('later');
+    await tick();
+    await second.flush(force: true);
+    expect(h.sent.last.context['userId'], 'rc_user_1', reason: 'the id still rides on every batch');
+
+    second.identify('rc_user_2');
+    await tick();
+    await second.flush(force: true);
+    expect(h.sent.last.context['userId'], 'rc_user_2');
+    expect(h.allEvents.where((e) => e['name'] == 'identify'), hasLength(2));
+
+    second.identify(null);
+    second.identify(null);
+    await tick();
+    await second.flush(force: true);
+    expect(h.allEvents.where((e) => e['name'] == 'reset'), hasLength(1));
+    expect(h.sent.last.context.containsKey('userId'), isFalse);
+  });
+
+  test('a test device sends testDevice: true and other devices leave it out', () async {
+    final detected = _Harness(device: _testDevice);
+    final sdk = detected.make();
+    await sdk.start();
+    await sdk.flush(force: true);
+    expect(detected.sent[0].context, <String, Object?>{'platform': 'ios', 'testDevice': true});
+
+    final plain = _Harness();
+    final sdk2 = plain.make();
+    await sdk2.start();
+    await sdk2.flush(force: true);
+    expect(plain.sent[0].context.containsKey('testDevice'), isFalse);
+
+    final notTest = _Harness(device: const DeviceContext(platform: 'ios', testDevice: false));
+    final sdk3 = notTest.make();
+    await sdk3.start();
+    await sdk3.flush(force: true);
+    expect(notTest.sent[0].context.containsKey('testDevice'), isFalse, reason: 'false is never sent');
+  });
+
+  test('the testDevice option overrides the detected value', () async {
+    final off = _Harness(device: _testDevice, options: const _Opts(testDevice: false));
+    final sdk = off.make();
+    await sdk.start();
+    await sdk.flush(force: true);
+    expect(off.sent[0].context.containsKey('testDevice'), isFalse);
+
+    final on = _Harness(options: const _Opts(testDevice: true));
+    final sdk2 = on.make();
+    await sdk2.start();
+    await sdk2.flush(force: true);
+    expect(on.sent[0].context['testDevice'], isTrue);
+
+    final viaContext = _Harness(options: const _Opts(context: DeviceContext(testDevice: true)));
+    final sdk3 = viaContext.make();
+    await sdk3.start();
+    await sdk3.flush(force: true);
+    expect(viaContext.sent[0].context['testDevice'], isTrue);
+  });
+
+  test('a platform_mismatch warning is logged once per launch on a test device', () async {
+    final h = _Harness(device: _testDevice, responseBody: _mismatchBody);
+    final sdk = h.make();
+    await sdk.start();
+    await sdk.flush(force: true);
+    sdk.track('again');
+    await tick();
+    await sdk.flush(force: true);
+    expect(h.sent, hasLength(2));
+    expect(h.logs, <String>[_mismatchText], reason: 'unknown warnings are ignored');
+    expect(h.storedQueue(), isEmpty);
+  });
+
+  test('server warnings are logged with debug, also on a 402, and not otherwise', () async {
+    final debug = _Harness(options: const _Opts(debug: true), statuses: <int>[402], responseBody: _mismatchBody);
+    final sdk = debug.make();
+    await sdk.start();
+    await sdk.flush(force: true);
+    expect(debug.logs.where((l) => l == _mismatchText), hasLength(1));
+
+    final quiet = _Harness(responseBody: _mismatchBody);
+    final sdk2 = quiet.make();
+    await sdk2.start();
+    await sdk2.flush(force: true);
+    expect(quiet.logs, isEmpty);
+
+    final rejected = _Harness(device: _testDevice, statuses: <int>[400], responseBody: _mismatchBody);
+    final sdk3 = rejected.make();
+    await sdk3.start();
+    await sdk3.flush(force: true);
+    expect(rejected.logs, isEmpty, reason: 'only stored batches carry warnings');
+  });
+
+  test('a missing or invalid response body means no warnings', () async {
+    for (final body in <String>['', 'not json', '[]', '{"warnings":"platform_mismatch"}', '{"warnings":[1,null]}']) {
+      final h = _Harness(device: _testDevice, responseBody: body);
+      final sdk = h.make();
+      await sdk.start();
+      await sdk.flush(force: true);
+      expect(h.logs, isEmpty, reason: body);
+      expect(h.storedQueue(), isEmpty, reason: 'the batch still counts as sent: $body');
+    }
+    expect(warningsFrom('{"warnings":["a",2,"b"]}'), <String>['a', 'b']);
+    expect(warningsFrom('null'), isEmpty);
   });
 
   test('disabled sends nothing', () async {

@@ -1,6 +1,6 @@
 Pod::Spec.new do |s|
   s.name             = 'appeeky_analytics'
-  s.version          = '0.2.0'
+  s.version          = '0.3.0'
   s.summary          = 'Appeeky Analytics for Flutter: native side for iOS.'
   s.description      = 'Apple Search Ads attribution token, SKAdNetwork / AdAttributionKit conversion values and the launch URL for the appeeky_analytics Flutter plugin.'
   s.homepage         = 'https://appeeky.com'

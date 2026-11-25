@@ -87,7 +87,16 @@ Future<void> main() async {
 Call `identify` again with the new id after `Purchases.logIn()`, and pass
 `null` on logout. With Superwall, pass the same user id you give
 `Superwall.shared.identify(userId: ...)`; Superwall's webhook events are
-matched to the install by it.
+matched to the install by it. `identify` can be called on every launch: it
+sends an event only when the id changes.
+
+### Test installs
+
+Debug builds are reported as test installs. They are kept out of your
+reports and shown in the dashboard's test data view, so development does not
+count as installs. Profile and release builds are reported as usual, also on
+a simulator or emulator. To decide yourself, pass `testDevice: true` or
+`testDevice: false` to `Appeeky.init`.
 
 ### Screens and events
 
@@ -228,6 +237,7 @@ replace the plugin's own.
 | `maxQueueSize` | `1000` | Oldest events are dropped beyond this; `first_open` and `ad_revenue` go last |
 | `sessionTimeout` | 30 min | Time in the background before a new session starts |
 | `context` | | `DeviceContext` fields that override the detected ones |
+| `testDevice` | detected | Report the install as a test install; by default debug builds are |
 | `getLaunchUrl` | | Fallback for the URL that opened the app |
 | `disabled` | `false` | Collect and send nothing, for example after an opt-out |
 
